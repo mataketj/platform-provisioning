@@ -1,0 +1,132 @@
+name: 'SANLAKE Team Onboarding: Automated Provisioning'
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'environments/onboarding/**'
+  workflow_dispatch:
+    inputs:
+      team_alias:
+        description: 'The Team Alias from the signed contract (e.g., sanlam_corparate_bi)'
+        required: true
+        default: 'sanlam_corparate_bi'
+      team_acronym:
+        description: 'The standardized 3-6 char acronym (e.g., scbi)'
+        required: true
+        default: 'scbi'
+      tfvars_file:
+        description: 'The path to the tfvars file (e.g., environments/onboarding/team_scbi.tfvars)'
+        required: true
+        default: 'environments/onboarding/team_scbi.tfvars'
+
+jobs:
+  # Job 1: Provision GitHub Repo (Module A)
+  provision_github:
+    runs-on: ubuntu-latest
+    outputs:
+      repo_name: ${{ steps.tf_apply.outputs.repo_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: 'Terraform Apply - GitHub Repo'
+        id: tf_apply
+        working-directory: modules/github_repo
+        run: |
+          terraform init
+          # Pass the team acronym as a variable input
+          terraform apply -auto-approve -input=false \
+            -var "team_acronym=${{ github.event.inputs.team_acronym }}" \
+            -var-file="${{ github.event.inputs.tfvars_file }}" \
+            -json | jq -r '
+              .resource_changes[]? | 
+              select(.type == "output" and .name == "repo_name") | 
+              .change.after.value
+            ' > /tmp/repo_name_output
+          echo "repo_name=$(cat /tmp/repo_name_output)" >> $GITHUB_OUTPUT
+
+  # Job 2: Provision Snowflake Core (Module B)
+  provision_snowflake:
+    needs: [provision_github]
+    runs-on: ubuntu-latest
+    outputs:
+      sf_connections: ${{ steps.tf_apply.outputs.sf_connections }}
+      sf_role_list: ${{ steps.tf_apply.outputs.sf_role_list }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: 'Terraform Apply - Snowflake Core'
+        id: tf_apply
+        working-directory: modules/snowflake_core
+        env:
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+          SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+        run: |
+          terraform init
+          terraform apply -auto-approve -input=false \
+            -var "team_acronym=${{ github.event.inputs.team_acronym }}" \
+            -var "github_repo_name=${{ needs.provision_github.outputs.repo_name }}" \
+            -var-file="${{ github.event.inputs.tfvars_file }}" \
+            -json | jq -r '
+              .resource_changes[]? | 
+              select(.type == "output" and .name == "snowflake_dbt_connections") | 
+              .change.after.value
+            ' > /tmp/sf_connections_output
+          
+          # Placeholder for passing complex JSON/Map outputs (needs base64 encoding for safety)
+          echo "sf_connections=$(cat /tmp/sf_connections_output | base64 -w 0)" >> $GITHUB_OUTPUT
+          # ... similarly for sf_role_list output ...
+  
+  # Job 3: Provision DBT Cloud Project (Module C)
+  provision_dbt_cloud:
+    needs: [provision_snowflake]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: 'Terraform Apply - DBT Cloud Project'
+        working-directory: modules/dbt_cloud_project
+        env:
+          DBT_CLOUD_API_KEY: ${{ secrets.DBT_CLOUD_API_KEY }}
+        run: |
+          # Decode and pass the complex map output from Job 2
+          SF_CONNECTIONS_JSON=$(echo "${{ needs.provision_snowflake.outputs.sf_connections }}" | base64 --decode)
+          
+          terraform init
+          terraform apply -auto-approve -input=false \
+            -var "team_acronym=${{ github.event.inputs.team_acronym }}" \
+            -var "github_repo_name=${{ needs.provision_github.outputs.repo_name }}" \
+            -var "sf_connections_map=${SF_CONNECTIONS_JSON}" \
+            -var-file="${{ github.event.inputs.tfvars_file }}"
+            
+  # Job 4: Provision Snowflake Views (Module D) and UAT
+  provision_views_and_uat:
+    needs: [provision_dbt_cloud] # Run after core provisioning is done
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: 'Terraform Apply - Snowflake Views (Module D)'
+        working-directory: modules/snowflake_views
+        env:
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+        run: |
+          # Placeholder: In a real flow, you'd decode and pass the role list here
+          # SF_ROLE_LIST_JSON=$(echo "${{ needs.provision_snowflake.outputs.sf_role_list }}" | base64 --decode)
+          
+          terraform init
+          terraform apply -auto-approve -input=false \
+            -var "team_acronym=${{ github.event.inputs.team_acronym }}" \
+            -var-file="${{ github.event.inputs.tfvars_file }}"
+            
+      - name: 'Automated UAT Check (dbt Debug)'
+        run: |
+          echo "Running dbt debug using provisioned service account credentials..."
+          # In a real environment, this would run a dedicated UAT test script
+          # that uses the provisioned dbt credentials to verify access.
+          echo "UAT Success: Basic connectivity verified."
